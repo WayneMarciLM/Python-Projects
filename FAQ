@@ -1,0 +1,332 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+import pytesseract
+from pdf2image import convert_from_path
+from pydantic import BaseModel, Field
+from typing import List, Dict
+
+# Load environment variables if needed
+load_dotenv()
+
+# Define the Section and StructuredDocument classes
+class Section(BaseModel):
+    title: str = Field(description="Concise section title (e.g., 'Rent', 'Term', 'Security Deposit')")
+    start_index: int = Field(description="Starting line number")
+    end_index: int = Field(description="Ending line number")
+    summary: str = Field(description="Concise summary containing key facts, figures, and specifics")
+    key_points: List[str] = Field(
+        description="Bullet points of critical information (dates, amounts, requirements)",
+        min_items=1
+    )
+
+class StructuredDocument(BaseModel):
+    sections: List[Section] = Field(description="Key lease sections with summaries")
+    property_address: str = Field(description="Full property address")
+    parties: dict = Field(description="Key parties involved (lessor, lessee, etc.)")
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    # Convert PDF pages to images and extract text using Tesseract
+    images = convert_from_path('../Lease/RE101-Real Estate Frequently Asked Questions (July 2024).pdf')
+    extracted_text = ""
+
+    for image in images:
+        extracted_text += pytesseract.image_to_string(image)
+    
+    return extracted_text
+
+def doc_with_lines(document: str) -> Dict[int, str]:
+    document_lines = document.split("\n")
+    line2text = {}
+    
+    for i, line in enumerate(document_lines):
+        line2text[i] = line.strip()  # Store stripped lines
+    
+    return line2text
+
+async def process_faq_document(pdf_path: str) -> None:
+    # Extract text
+    extracted_text = extract_text_from_pdf(pdf_path)
+    
+    # Assign line numbers to extracted text
+    indexed_lines = doc_with_lines(extracted_text)
+    
+    # Print indexed lines for debugging
+    for index, line in indexed_lines.items():
+        print(f"[{index}] {line}")
+    
+    # Here, you can implement logic to detect sections in your FAQ document
+    # and create Section instances for each section found in the extracted text
+    # For now, we are just printing the lines, but this is where the parsing would occur.
+
+# Test the process on your FAQ document
+async def main():
+    faq_pdf_path = '../FAQ/Your_FAQ_Document.pdf'  # Path to your FAQ PDF
+    await process_faq_document(faq_pdf_path)
+
+await main()
+
+
+
+#cell 2:
+
+import sys
+import os
+from dotenv import load_dotenv
+import instructor
+import openai
+from typing import List, Dict
+from pydantic import BaseModel, Field
+from tenacity import Retrying, stop_after_attempt, wait_fixed
+from IPython.display import Markdown, display
+import re
+
+# Append the src directory to the system path to allow imports
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), 'src')))
+load_dotenv()
+
+# Import the constants module for OpenAI model reference
+import constants as consts
+
+# Initialize the OpenAI client with Azure endpoint settings
+client = instructor.patch(
+    openai.AzureOpenAI(
+        azure_endpoint=os.getenv("CORTEXT_API_BASE"),
+        api_version=os.getenv("CORTEX_API_VERSION"),
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        default_headers={"use-case": "FAQ Extraction"},
+    ),
+)
+
+# Updated system prompt for FAQ extraction
+system_prompt = f"""\ 
+You are an expert information extraction AI. Your goal is to identify and structure key concepts from the FAQ document. Follow these guidelines:
+
+1. ORGANIZATION:
+- Identify and create sections based on significant topics discussed.
+- Focus on self-contained sections that capture the essence of each topic.
+- Maintain consistent formatting for clarity and easy reading.
+- Use clear section headers in ALL CAPS.
+
+2. CONTENT REQUIREMENTS:
+For each section:
+- Capture the main question and its corresponding answer.
+- Provide concise summaries and relevant details.
+- Include bullet points for clarity, if applicable.
+
+3. ESSENTIAL SECTIONS TO IDENTIFY:
+- General Information: Overview of the topic.
+- Specific Queries: Detailed answers to common questions.
+- Important Policies: Key guidelines or regulations related to the FAQ.
+- Contact Information: Who to reach out to for more questions.
+
+4. ADDITIONAL GUIDELINES:
+- Highlight unique or important points that may require attention.
+- Ensure the format is easy to parse for retrieval in a Q&A system.
+- Use clear, direct language that is easy to understand.
+
+5. FORMAT REQUIREMENTS:
+- Use ALL CAPS for section headers.
+- Use bullet points for easy scanning where applicable.
+- Maintain a clear separation between distinct topics.
+
+Remember:
+- Be thorough but concise - each section should deliver value.
+- Focus on clarity and self-containment in the content you provide.
+"""
+
+# Define the Section data model
+class Section(BaseModel):
+    title: str = Field(description="Title of the section.")
+    content: str = Field(description="Content of the section.")
+    start_index: int = Field(description="Starting line number")
+    end_index: int = Field(description="Ending line number")
+    key_points: List[str] = Field(default_factory=list)  # Initialize as empty list if not provided
+
+def get_structured_document(document_with_line_numbers: str) -> List[Section]:
+    response = client.chat.completions.create(
+        model=consts.OpenAIModel.GPT_4_OMNI,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": document_with_line_numbers,
+            },
+        ],
+    )
+    
+    # Process the response to extract structured sections
+    structured_sections = response.choices[0].message.content.strip()
+    
+    # Debug: Print the structured sections to understand its format
+    print("Structured Sections Output:\n", structured_sections)
+
+    sections = []
+    start_index = 0  # Initialize the start index
+    
+    # Use regex to find section headers and contents
+    section_pattern = re.compile(r'(.*?)(?:\n\n|\Z)', re.DOTALL)  # Match any content until double newlines or end of string
+    matches = section_pattern.findall(structured_sections)
+    
+    for match in matches:
+        if match.strip():  # Only process non-empty sections
+            # This assumes the first line is the title
+            parts = match.strip().split('\n', 1)  # Split on the first newline
+            if len(parts) == 2:  # Ensure we have both title and content
+                title, content = parts
+                end_index = start_index + content.count('\n') + 1  # Calculate end_index based on line count
+                sections.append(Section(title=title.strip(), content=content.strip(), start_index=start_index, end_index=end_index))
+                start_index = end_index  # Update start_index for the next section
+            else:
+                print(f"Skipping malformed section: {match}")
+    
+    return sections
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    from pdf2image import convert_from_path
+    import pytesseract
+
+    # Convert PDF pages to images and extract text using Tesseract
+    images = convert_from_path(pdf_path)
+    extracted_text = ""
+
+    for image in images:
+        extracted_text += pytesseract.image_to_string(image)
+    
+    return extracted_text
+
+def doc_with_lines(document: str) -> Dict[int, str]:
+    document_lines = document.split("\n")
+    line2text = {}
+    
+    for i, line in enumerate(document_lines):
+        line2text[i] = line.strip()  # Store stripped lines
+    
+    return line2text
+
+def get_sections_text(structured_doc: List[Section], line2text: Dict[int, str]) -> List[Dict[str, str]]:
+    segments = []
+    for s in structured_doc:
+        contents = []
+        for line_id in range(s.start_index, s.end_index):
+            contents.append(line2text.get(line_id, ''))
+        content_text = "\n".join(contents)
+        segments.append({
+            "title": s.title,
+            "content": content_text,
+            "summary": content_text,  # Using content as summary for backward compatibility
+            "start": s.start_index,
+            "end": s.end_index
+        })
+    return segments
+
+def create_markdown_summary(structured_doc: List[Section]) -> str:
+    markdown_string = "# FAQ Summary\n\n"
+
+    # Key Sections
+    for section in structured_doc:
+        markdown_string += f"## {section.title}\n"
+        markdown_string += f"{section.content}\n\n"
+        
+        markdown_string += "**Key Points:**\n"
+        for point in section.key_points:
+            markdown_string += f"- {point}\n"
+        
+        markdown_string += "\n---\n\n"
+    
+    return markdown_string
+
+async def process_faq_document(pdf_path: str) -> None:
+    # Extract text from the PDF
+    extracted_text = extract_text_from_pdf(pdf_path)
+    
+    # Assign line numbers to the extracted text
+    indexed_lines = doc_with_lines(extracted_text)
+    
+    # Convert the indexed lines to a single string format for the AI model
+    document_with_line_numbers = "\n".join(f"[{i}] {line}" for i, line in indexed_lines.items())
+    
+    # Call the method to get structured documents
+    structured_doc = get_structured_document(document_with_line_numbers)  # Get structured sections
+    
+    # Convert sections to text segments
+    segments = get_sections_text(structured_doc, indexed_lines)
+    
+    # Display segments count
+    print(f"Total Segments: {len(segments)}")
+    
+    # Display the first segment for validation
+    print("First Segment:\n", segments[0])
+    
+    # Generate and display the markdown summary
+    markdown_display = create_markdown_summary(structured_doc)
+    display(Markdown(markdown_display))
+
+# Test the process on your FAQ document
+async def main():
+    faq_pdf_path = '../Lease/RE101-Real Estate Frequently Asked Questions (July 2024).pdf'  # Path to your FAQ PDF
+    await process_faq_document(faq_pdf_path)
+
+await main()
+
+
+#cell 3
+
+async def process_faq_document(pdf_path: str) -> None:
+    # Extract text from the PDF
+    extracted_text = extract_text_from_pdf(pdf_path)
+    
+    # Assign line numbers to the extracted text
+    indexed_lines = doc_with_lines(extracted_text)
+    
+    # Convert the indexed lines to a single string format for the AI model
+    document_with_line_numbers = "\n".join(f"[{i}] {line}" for i, line in indexed_lines.items())
+    
+    # Call the method to get structured documents
+    structured_doc = get_structured_document(document_with_line_numbers)  # Get structured sections
+    
+    # Convert sections to text segments
+    segments = get_sections_text(structured_doc, indexed_lines)
+    
+    # Display segments count
+    print(f"Total Segments: {len(segments)}")
+    
+    # Display the first segment for validation
+    print("First Segment:\n", segments[0])
+    
+    # Generate and display the markdown summary
+    markdown_display = create_markdown_summary(structured_doc)
+    display(Markdown(markdown_display))
+
+    # Create DataFrame with titles, content, and an empty embedding column
+    titles = [s['title'] for s in segments]
+    content = [s['content'] for s in segments]
+    
+    output_df = pd.DataFrame({'titles': titles, 'content': content, 'embedding': [None] * len(segments)})
+    
+    # List of illegal characters in Excel
+    ILLEGAL_CHARACTERS_RE = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
+
+    # Function to clean a single cell
+    def clean_cell(cell):
+        if isinstance(cell, str):
+            return ILLEGAL_CHARACTERS_RE.sub("", cell)
+        return cell
+
+    # Apply the clean_cell function to the entire DataFrame
+    output_df = output_df.apply(lambda x: x.apply(clean_cell))
+
+    # Debug: Print the DataFrame before exporting
+    print("DataFrame ready for export:")
+    print(output_df.head())  # Display the first few rows of the DataFrame
+    
+    # Export the DataFrame to Excel
+    try:
+        output_df.to_excel('../Lease/ERES_FAQ_EXPORT.xlsx', index=False)
+        print("DataFrame exported to 'ERES_FAQ_EXPORT.xlsx'.")
+    except Exception as e:
+        print(f"Error during exporting: {str(e)}")
+
